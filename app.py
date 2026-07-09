@@ -34,25 +34,31 @@ async def transcribe_audio(audio: UploadFile = File(...)):
 
 @app.get("/tts-stream")
 async def text_to_speech(text: str = Query(...)):
+    """Streams neural voice chunks sentence-by-sentence to prevent 504 gateway timeouts."""
     try:
+        # 1. Use Kokoro's generator pipeline to break text down cleanly
         generator = tts_pipeline(text, voice='af_heart', speed=0.9, split_pattern=r'\n')
-        
-        for gs, ps, audio in generator:
-            wav_io = io.BytesIO()
-            sf.write(wav_io, audio, 24000, format='WAV', subtype='PCM_16')
-            wav_io.seek(0)
-            
-            # Explicit headers tell iOS/Android exactly how to handle the stream
-            headers = {
-                "Content-Disposition": "inline; filename=\"speech.wav\"",
-                "Accept-Ranges": "bytes"
-            }
-            
-            return StreamingResponse(
-                wav_io, 
-                media_type="audio/wav", 
-                headers=headers
-            )
+
+        def audio_stream_generator():
+            for gs, ps, audio in generator:
+                # Convert this individual sentence slice directly to memory bytes
+                wav_io = io.BytesIO()
+                sf.write(wav_io, audio, 24000, format='WAV', subtype='PCM_16')
+                yield wav_io.getvalue()
+
+        # 2. Return an active streaming pipe back through your proxy network
+        headers = {
+            "Content-Disposition": "inline; filename=\"speech.wav\"",
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive"
+        }
+
+        return StreamingResponse(
+            audio_stream_generator(), 
+            media_type="audio/wav", 
+            headers=headers
+        )
             
     except Exception as e:
         return {"error": str(e)}, 500
