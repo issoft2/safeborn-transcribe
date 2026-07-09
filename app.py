@@ -40,13 +40,13 @@ async def transcribe_audio(audio: UploadFile = File(...)):
 
 
 @app.get("/tts-stream")
-async def text_to_speech(text: str = Query(...)):
+async def text_to_speech(text: str = Query(...), speed: float = Query(0.90)):
     try:
         # Clean up structural text breaks cleanly
         clean_text = " ".join(text.splitlines())
         
         # SPEED FIX: Added 'split_pattern' to keep the generator moving fast without heavy NLP logic
-        generator = tts_pipeline(clean_text, voice='af_heart', speed=0.95, split_pattern=r'[.!?\n]')
+        generator = tts_pipeline(clean_text, voice='af_heart', speed=speed, split_pattern=r'[.!?\n]')
         
         audio_chunks = []
         for gs, ps, audio in generator:
