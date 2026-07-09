@@ -2,7 +2,7 @@ import os
 from fastapi import FastAPI, UploadFile, File, Query
 from fastapi.responses import StreamingResponse
 from faster_whisper import WhisperModel
-from kokoro import KPIpeline
+from kokoro import KPipeline
 import io
 import soundfile as sf
 
@@ -13,7 +13,7 @@ app = FastAPI(title="SafeBorn Voice Engine")
 stt_model = WhisperModel("base", device="cpu", compute_type="int8")
 
 # Initialize Kokoro Pipeline ('a' for American English, automatically downloads the 82MB weights)
-tts_pipeline = KPIpeline(lang_code='a')
+tts_pipeline = KPipeline(lang_code='a')
 
 @app.post("/transcribe")
 async def transcribe_audio(audio: UploadFile = File(...)):
