@@ -10,12 +10,12 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Install optimized packages directly
+# Install optimized packages directly (CHANGED kokoro-onnx to kokoro)
 RUN pip install --no-cache-dir \
     fastapi \
     uvicorn \
     faster-whisper \
-    kokoro-onnx \
+    kokoro \
     soundfile \
     python-multipart
 
@@ -24,4 +24,4 @@ COPY . .
 EXPOSE 8081
 
 # Spin up Uvicorn listening on the internal Railway execution port
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8081"]
