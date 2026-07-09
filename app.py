@@ -32,7 +32,7 @@ async def transcribe_audio(audio: UploadFile = File(...)):
         return {"error:": str(e)}, 500  
         
 
-@app.get("tts-stream")
+@app.get("/tts-stream")
 async def text_to_speech(text: str = Query(...)):
     """Generates hyper-realistic neural voice audio stream matching the text input:"""
     try:
