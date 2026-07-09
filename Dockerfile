@@ -19,6 +19,9 @@ RUN pip install --no-cache-dir \
     soundfile \
     python-multipart
 
+# Add this right after your RUN pip install --no-cache-dir ... block
+RUN python -m spacy download en_core_web_sm    
+
 COPY . .
 
 EXPOSE 8081
