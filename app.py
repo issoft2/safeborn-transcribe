@@ -34,19 +34,25 @@ async def transcribe_audio(audio: UploadFile = File(...)):
 
 @app.get("/tts-stream")
 async def text_to_speech(text: str = Query(...)):
-    """Generates hyper-realistic neural voice audio stream matching the text input:"""
     try:
-        # Generate audio frame ('af_heart' is a warm, highly empathetic female voice)
         generator = tts_pipeline(text, voice='af_heart', speed=0.9, split_pattern=r'\n')
-
-        # Grab the first complete sentence chunk array
-        for gs, ps, audio in generator:
-            # Convert raw float32 array into an optimized WAV container stream
-            wav_io = io.BytesIO()
-            sf.write(wav_io, audio, 24000, format="WAV", subtypes="PCM_16")
-            wav_io.seek(0)
-
-            return StreamingResponse(wav_io, media_type="audio/wav")
         
+        for gs, ps, audio in generator:
+            wav_io = io.BytesIO()
+            sf.write(wav_io, audio, 24000, format='WAV', subtype='PCM_16')
+            wav_io.seek(0)
+            
+            # Explicit headers tell iOS/Android exactly how to handle the stream
+            headers = {
+                "Content-Disposition": "inline; filename=\"speech.wav\"",
+                "Accept-Ranges": "bytes"
+            }
+            
+            return StreamingResponse(
+                wav_io, 
+                media_type="audio/wav", 
+                headers=headers
+            )
+            
     except Exception as e:
-        return {"error: ": str(e)}, 500
+        return {"error": str(e)}, 500
