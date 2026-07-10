@@ -36,7 +36,19 @@ _executor = ThreadPoolExecutor(max_workers=2)
 
 def _run_transcription(audio_bytes: bytes) -> str:
     audio_file = io.BytesIO(audio_bytes)
-    segments, _info = stt_model.transcribe(audio_file, beam_size=3)
+    # vad_filter strips non-speech segments (silence, background noise) before
+    # decoding. Without it, Whisper tends to hallucinate plausible-sounding
+    # phrases from silence/noise rather than returning nothing — harmless with
+    # manual push-to-talk, but the hands-free loop can legitimately end a turn
+    # on mostly-silence (a long pause, ambient noise crossing the volume
+    # threshold), and a hallucinated transcript there gets sent as if she'd
+    # actually said it.
+    segments, _info = stt_model.transcribe(
+        audio_file,
+        beam_size=3,
+        vad_filter=True,
+        vad_parameters={"min_silence_duration_ms": 500},
+    )
     return " ".join(segment.text for segment in segments).strip()
 
 
