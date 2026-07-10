@@ -14,6 +14,9 @@ from kokoro import KPipeline
 from faster_whisper import WhisperModel
 import os
 
+torch.set_num_threads(2)
+torch.set_num_interop_threads(1)
+
 app = FastAPI(title="SafeBorn Voice Engine")
 
 app.add_middleware(
