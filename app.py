@@ -3,6 +3,7 @@ import io
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
+import torch
 
 import numpy as np
 import soundfile as sf
@@ -11,6 +12,7 @@ from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from kokoro import KPipeline
 from faster_whisper import WhisperModel
+import os
 
 app = FastAPI(title="SafeBorn Voice Engine")
 
@@ -48,8 +50,23 @@ logger.info("Voice engine services are warm and ready!")
 # stt_model.transcribe(...) and tts_pipeline(...) are blocking, CPU-bound calls.
 # Running them directly inside `async def` routes stalls the event loop for
 # every other request (including /health) until they finish. Offload them here.
-_executor = ThreadPoolExecutor(max_workers=2)
+tts_executor = ThreadPoolExecutor(max_workers=1)
+stt_executor = ThreadPoolExecutor(max_workers=2)
 
+logger.info(f"os.cpu_count() = {os.cpu_count()}")
+
+logger.info(
+    "Torch threads=%d interop=%d",
+    torch.get_num_threads(),
+    torch.get_num_interop_threads(),
+)
+
+from pathlib import Path
+
+cpu_max = Path("/sys/fs/cgroup/cpu.max")
+
+if cpu_max.exists():
+    logger.info(cpu_max.read_text())
 
 def _run_transcription(audio_bytes: bytes) -> str:
     started = time.monotonic()
@@ -102,7 +119,7 @@ async def transcribe_audio(audio: UploadFile = File(...)):
     audio_bytes = await audio.read()
     loop = asyncio.get_event_loop()
     try:
-        transcription = await loop.run_in_executor(_executor, _run_transcription, audio_bytes)
+        transcription = await loop.run_in_executor(tts_executor, _run_transcription, audio_bytes)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     return {"text": transcription}
@@ -115,7 +132,7 @@ async def text_to_speech(text: str = Query(...), speed: float = Query(0.90)):
 
     loop = asyncio.get_event_loop()
     try:
-        wav_bytes = await loop.run_in_executor(_executor, _run_tts, clean_text, speed)
+        wav_bytes = await loop.run_in_executor(stt_executor, _run_tts, clean_text, speed)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
