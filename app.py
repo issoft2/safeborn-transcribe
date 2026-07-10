@@ -1,5 +1,6 @@
 import asyncio
 import io
+import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -21,13 +22,28 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-print("Loading Whisper Speech-to-Text model...")
+# print() follows normal stdout buffering — line-buffered on a real terminal,
+# but fully block-buffered (waits for several KB) once stdout is piped/redirected,
+# which is exactly what happens inside a container or behind a process manager.
+# logging.StreamHandler flushes after every record regardless, which is why
+# uvicorn's own access logs (which go through `logging`) show up fine while our
+# print() calls didn't. Configuring our own handler explicitly here rather than
+# relying on however uvicorn's root logger happens to be set up for this process.
+logger = logging.getLogger("safeborn-voice")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logger.addHandler(_handler)
+    logger.propagate = False
+
+logger.info("Loading Whisper Speech-to-Text model...")
 # Optimized Whisper initialization to prevent CPU cache thrashing
 stt_model = WhisperModel("base", device="cpu", compute_type="int8", cpu_threads=2)
 
-print("Loading Kokoro neural voice pipeline into memory...")
+logger.info("Loading Kokoro neural voice pipeline into memory...")
 tts_pipeline = KPipeline(lang_code='a', repo_id='hexgrad/Kokoro-82M')
-print("Voice engine services are warm and ready!")
+logger.info("Voice engine services are warm and ready!")
 
 # stt_model.transcribe(...) and tts_pipeline(...) are blocking, CPU-bound calls.
 # Running them directly inside `async def` routes stalls the event loop for
@@ -57,7 +73,7 @@ def _run_transcription(audio_bytes: bytes) -> str:
         vad_parameters={"min_silence_duration_ms": 500},
     )
     text = " ".join(segment.text for segment in segments).strip()
-    print(f"[timing] transcription took {time.monotonic() - started:.2f}s")
+    logger.info(f"[timing] transcription took {time.monotonic() - started:.2f}s")
     return text
 
 
@@ -77,7 +93,7 @@ def _run_tts(clean_text: str, speed: float) -> bytes:
 
     wav_io = io.BytesIO()
     sf.write(wav_io, combined_audio, 24000, format='WAV', subtype='PCM_16')
-    print(f"[timing] tts for {len(clean_text)} chars took {time.monotonic() - started:.2f}s")
+    logger.info(f"[timing] tts for {len(clean_text)} chars took {time.monotonic() - started:.2f}s")
     return wav_io.getvalue()
 
 
@@ -103,7 +119,7 @@ async def text_to_speech(text: str = Query(...), speed: float = Query(0.90)):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        print(f"Generation failure: {str(e)}")
+        logger.error(f"Generation failure: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
     return StreamingResponse(
