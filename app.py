@@ -1,5 +1,6 @@
 import asyncio
 import io
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -35,6 +36,7 @@ _executor = ThreadPoolExecutor(max_workers=2)
 
 
 def _run_transcription(audio_bytes: bytes) -> str:
+    started = time.monotonic()
     audio_file = io.BytesIO(audio_bytes)
     # vad_filter strips non-speech segments (silence, background noise) before
     # decoding. Without it, Whisper tends to hallucinate plausible-sounding
@@ -43,16 +45,24 @@ def _run_transcription(audio_bytes: bytes) -> str:
     # on mostly-silence (a long pause, ambient noise crossing the volume
     # threshold), and a hallucinated transcript there gets sent as if she'd
     # actually said it.
+    #
+    # beam_size=1 (greedy decoding) instead of 3: cuts decoding work roughly
+    # 3x for a small accuracy cost that mostly doesn't matter on short
+    # conversational utterances. If transcription quality noticeably degrades
+    # in testing, raise this back up — it's a direct latency/accuracy trade.
     segments, _info = stt_model.transcribe(
         audio_file,
-        beam_size=3,
+        beam_size=1,
         vad_filter=True,
         vad_parameters={"min_silence_duration_ms": 500},
     )
-    return " ".join(segment.text for segment in segments).strip()
+    text = " ".join(segment.text for segment in segments).strip()
+    print(f"[timing] transcription took {time.monotonic() - started:.2f}s")
+    return text
 
 
 def _run_tts(clean_text: str, speed: float) -> bytes:
+    started = time.monotonic()
     generator = tts_pipeline(clean_text, voice='af_heart', speed=speed, split_pattern=r'[.!?\n]')
 
     audio_chunks = []
@@ -67,6 +77,7 @@ def _run_tts(clean_text: str, speed: float) -> bytes:
 
     wav_io = io.BytesIO()
     sf.write(wav_io, combined_audio, 24000, format='WAV', subtype='PCM_16')
+    print(f"[timing] tts for {len(clean_text)} chars took {time.monotonic() - started:.2f}s")
     return wav_io.getvalue()
 
 
