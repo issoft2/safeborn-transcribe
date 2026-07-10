@@ -95,23 +95,105 @@ def _run_transcription(audio_bytes: bytes) -> str:
 
 
 def _run_tts(clean_text: str, speed: float) -> bytes:
-    started = time.monotonic()
-    generator = tts_pipeline(clean_text, voice='af_heart', speed=speed, split_pattern=r'[.!?\n]')
+    overall_start = time.monotonic()
 
+    logger.info("=" * 70)
+    logger.info(f"TTS Request: {len(clean_text)} chars")
+    logger.info(f"Text: {clean_text!r}")
+
+    # -------------------------------------------------------
+    # Stage 1 - Create generator
+    # -------------------------------------------------------
+    t = time.monotonic()
+
+    generator = tts_pipeline(
+        clean_text,
+        voice="af_heart",
+        speed=speed,
+        split_pattern=r"[.!?\n]"
+    )
+
+    logger.info(
+        "[Stage 1] Generator created in %.3f sec",
+        time.monotonic() - t
+    )
+
+    # -------------------------------------------------------
+    # Stage 2 - Generate chunks
+    # -------------------------------------------------------
     audio_chunks = []
-    for _gs, _ps, audio in generator:
+
+    stage2_start = time.monotonic()
+    last_chunk = stage2_start
+
+    for idx, (_gs, _ps, audio) in enumerate(generator, start=1):
+
+        now = time.monotonic()
+
+        logger.info(
+            "[Stage 2] Chunk %d generated in %.3f sec",
+            idx,
+            now - last_chunk
+        )
+
+        last_chunk = now
+
         if audio is not None and len(audio) > 0:
             audio_chunks.append(audio)
 
+    logger.info(
+        "[Stage 2] Total chunk generation: %.3f sec",
+        time.monotonic() - stage2_start
+    )
+
     if not audio_chunks:
-        raise ValueError("No audio could be generated")
+        raise ValueError("No audio generated")
+
+    # -------------------------------------------------------
+    # Stage 3 - Concatenate
+    # -------------------------------------------------------
+    t = time.monotonic()
 
     combined_audio = np.concatenate(audio_chunks)
 
+    logger.info(
+        "[Stage 3] np.concatenate(): %.3f sec",
+        time.monotonic() - t
+    )
+
+    # -------------------------------------------------------
+    # Stage 4 - Encode WAV
+    # -------------------------------------------------------
+    t = time.monotonic()
+
     wav_io = io.BytesIO()
-    sf.write(wav_io, combined_audio, 24000, format='WAV', subtype='PCM_16')
-    logger.info(f"[timing] tts for {len(clean_text)} chars took {time.monotonic() - started:.2f}s")
-    return wav_io.getvalue()
+
+    sf.write(
+        wav_io,
+        combined_audio,
+        24000,
+        format="WAV",
+        subtype="PCM_16",
+    )
+
+    wav_bytes = wav_io.getvalue()
+
+    logger.info(
+        "[Stage 4] WAV encoding: %.3f sec",
+        time.monotonic() - t
+    )
+
+    # -------------------------------------------------------
+    # Total
+    # -------------------------------------------------------
+    logger.info(
+        "[TOTAL] %.3f sec",
+        time.monotonic() - overall_start
+    )
+
+    logger.info("=" * 70)
+
+    return wav_bytes
 
 
 @app.post("/transcribe")
