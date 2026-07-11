@@ -1,10 +1,12 @@
 import asyncio
 import io
 import logging
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor
-import torch
+from pathlib import Path
 
+import torch
 import numpy as np
 import soundfile as sf
 from fastapi import FastAPI, HTTPException, Query, UploadFile, File
@@ -12,8 +14,37 @@ from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from kokoro import KPipeline
 from faster_whisper import WhisperModel
-import os
 
+
+def _detect_cpu_count() -> int:
+    """os.cpu_count() reports the HOST's total cores, not what a container is
+    actually allotted — in a Docker/K8s deployment with a CPU limit set, this
+    silently oversizes every thread/pool calculation below. Prefer the cgroup
+    v2 quota (/sys/fs/cgroup/cpu.max: "$MAX $PERIOD" in microseconds, where
+    max/period is the real usable core count) when it's available and finite.
+    """
+    cpu_max_path = Path("/sys/fs/cgroup/cpu.max")
+    if cpu_max_path.exists():
+        try:
+            max_str, period_str = cpu_max_path.read_text().split()
+            if max_str != "max":
+                quota = int(max_str) / int(period_str)
+                if quota > 0:
+                    return max(1, int(quota))  # round down: safer to under- than over-allocate
+        except (ValueError, OSError):
+            pass
+    return os.cpu_count() or 2
+
+
+_CPU_COUNT = _detect_cpu_count()
+
+# Must be set before importing torch/kokoro/faster_whisper — some backends
+# (OpenMP/MKL) read these once at import/initialization time, not per-call.
+# Without this, PyTorch defaults to grabbing every visible CPU core for its
+# internal math ops on every single inference call, with zero awareness that
+# another synthesis job might be running concurrently.
+os.environ.setdefault("OMP_NUM_THREADS", str(max(1, _CPU_COUNT - 1)))
+os.environ.setdefault("MKL_NUM_THREADS", str(max(1, _CPU_COUNT - 1)))
 
 app = FastAPI(title="SafeBorn Voice Engine")
 
@@ -48,26 +79,30 @@ logger.info("Loading Kokoro neural voice pipeline into memory...")
 tts_pipeline = KPipeline(lang_code='a', repo_id='hexgrad/Kokoro-82M')
 logger.info("Voice engine services are warm and ready!")
 
+# torch.set_num_threads always takes precedence over the OMP/MKL env vars set
+# above, so this is the actual authoritative bound — the env vars are a
+# best-effort backstop for anything that reads them directly instead of going
+# through torch. Leaving one core of headroom for the event loop / request
+# handling rather than letting Kokoro claim the entire quota.
+torch.set_num_threads(max(1, _CPU_COUNT - 1))
+
 # stt_model.transcribe(...) and tts_pipeline(...) are blocking, CPU-bound calls.
 # Running them directly inside `async def` routes stalls the event loop for
 # every other request (including /health) until they finish. Offload them here.
+#
+# IMPORTANT: match these to the *correct* route below — /transcribe must use
+# stt_executor and /tts-stream must use tts_executor. They were swapped once
+# already (stt_executor had max_workers=2 but was wired to /tts-stream), which
+# silently let two TTS synthesis calls run concurrently and contend for CPU —
+# exactly the problem torch.set_num_threads above is trying to prevent.
 tts_executor = ThreadPoolExecutor(max_workers=1)
 stt_executor = ThreadPoolExecutor(max_workers=2)
 
-logger.info(f"os.cpu_count() = {os.cpu_count()}")
-
 logger.info(
-    "Torch threads=%d interop=%d",
-    torch.get_num_threads(),
-    torch.get_num_interop_threads(),
+    f"CPU sizing: detected={_CPU_COUNT} (host os.cpu_count()={os.cpu_count()}), "
+    f"torch.set_num_threads={torch.get_num_threads()}, "
+    f"interop={torch.get_num_interop_threads()}"
 )
-
-from pathlib import Path
-
-cpu_max = Path("/sys/fs/cgroup/cpu.max")
-
-if cpu_max.exists():
-    logger.info(cpu_max.read_text())
 
 def _run_transcription(audio_bytes: bytes) -> str:
     started = time.monotonic()
@@ -202,7 +237,7 @@ async def transcribe_audio(audio: UploadFile = File(...)):
     audio_bytes = await audio.read()
     loop = asyncio.get_event_loop()
     try:
-        transcription = await loop.run_in_executor(tts_executor, _run_transcription, audio_bytes)
+        transcription = await loop.run_in_executor(stt_executor, _run_transcription, audio_bytes)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     return {"text": transcription}
@@ -215,7 +250,7 @@ async def text_to_speech(text: str = Query(...), speed: float = Query(0.90)):
 
     loop = asyncio.get_event_loop()
     try:
-        wav_bytes = await loop.run_in_executor(stt_executor, _run_tts, clean_text, speed)
+        wav_bytes = await loop.run_in_executor(tts_executor, _run_tts, clean_text, speed)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
