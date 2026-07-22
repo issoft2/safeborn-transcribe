@@ -74,7 +74,7 @@ logger.info("Voice engine services are warm and ready!")
 torch.set_num_threads(max(1, _CPU_COUNT - 1))
 torch.set_num_interop_threads(1)
 
-tts_executor = ThreadPoolExecutor(max_workers=1)
+tts_executor = ThreadPoolExecutor(max_workers=2)
 stt_executor = ThreadPoolExecutor(max_workers=min(2, _CPU_COUNT))
 
 logger.info(
