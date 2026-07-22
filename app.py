@@ -82,11 +82,22 @@ logger.info(
     f"torch.set_num_threads={torch.get_num_threads()}, "
     f"interop={torch.get_num_interop_threads()}"
 )
-import os
+
 
 logging.info(
     f"CPU affinity: {len(os.sched_getaffinity(0))} CPUs "
     f"{os.sched_getaffinity(0)}"
+)
+
+logging.info(
+    f"""
+CPU config:
+Detected CPUs: {_CPU_COUNT}
+OMP: {os.getenv('OMP_NUM_THREADS')}
+MKL: {os.getenv('MKL_NUM_THREADS')}
+Torch threads: {torch.get_num_threads()}
+Torch interop: {torch.get_num_interop_threads()}
+"""
 )
 
 def _run_transcription(audio_bytes: bytes) -> str:
