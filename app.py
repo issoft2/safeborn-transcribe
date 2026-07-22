@@ -6,15 +6,6 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-import torch
-import numpy as np
-import soundfile as sf
-from fastapi import FastAPI, HTTPException, Query, UploadFile, File
-from fastapi.responses import StreamingResponse
-from fastapi.middleware.cors import CORSMiddleware
-from kokoro import KPipeline
-from faster_whisper import WhisperModel
-
 
 def _detect_cpu_count() -> int:
     """os.cpu_count() reports the HOST's total cores, not what a container is
@@ -38,13 +29,18 @@ def _detect_cpu_count() -> int:
 
 _CPU_COUNT = _detect_cpu_count()
 
-# Must be set before importing torch/kokoro/faster_whisper — some backends
-# (OpenMP/MKL) read these once at import/initialization time, not per-call.
-# Without this, PyTorch defaults to grabbing every visible CPU core for its
-# internal math ops on every single inference call, with zero awareness that
-# another synthesis job might be running concurrently.
 os.environ.setdefault("OMP_NUM_THREADS", str(max(1, _CPU_COUNT - 1)))
 os.environ.setdefault("MKL_NUM_THREADS", str(max(1, _CPU_COUNT - 1)))
+
+import torch
+import numpy as np
+import soundfile as sf
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File
+from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from kokoro import KPipeline
+from faster_whisper import WhisperModel
+
 
 app = FastAPI(title="SafeBorn Voice Engine")
 
@@ -73,7 +69,7 @@ if not logger.handlers:
 
 logger.info("Loading Whisper Speech-to-Text model...")
 # Optimized Whisper initialization to prevent CPU cache thrashing
-stt_model = WhisperModel("base", device="cpu", compute_type="int8", cpu_threads=2)
+stt_model = WhisperModel("base", device="cpu", compute_type="int8", cpu_threads=2, num_workers=1)
 
 logger.info("Loading Kokoro neural voice pipeline into memory...")
 tts_pipeline = KPipeline(lang_code='a', repo_id='hexgrad/Kokoro-82M')
@@ -85,6 +81,7 @@ logger.info("Voice engine services are warm and ready!")
 # through torch. Leaving one core of headroom for the event loop / request
 # handling rather than letting Kokoro claim the entire quota.
 torch.set_num_threads(max(1, _CPU_COUNT - 1))
+torch.set_num_interop_threads(1)
 
 # stt_model.transcribe(...) and tts_pipeline(...) are blocking, CPU-bound calls.
 # Running them directly inside `async def` routes stalls the event loop for
@@ -96,7 +93,7 @@ torch.set_num_threads(max(1, _CPU_COUNT - 1))
 # silently let two TTS synthesis calls run concurrently and contend for CPU —
 # exactly the problem torch.set_num_threads above is trying to prevent.
 tts_executor = ThreadPoolExecutor(max_workers=1)
-stt_executor = ThreadPoolExecutor(max_workers=2)
+stt_executor = ThreadPoolExecutor(max_workers=min(2, _CPU_COUNT))
 
 logger.info(
     f"CPU sizing: detected={_CPU_COUNT} (host os.cpu_count()={os.cpu_count()}), "
