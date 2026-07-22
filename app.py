@@ -5,6 +5,7 @@ import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+import math
 
 
 def _detect_cpu_count() -> int:
@@ -21,7 +22,7 @@ def _detect_cpu_count() -> int:
             if max_str != "max":
                 quota = int(max_str) / int(period_str)
                 if quota > 0:
-                    return max(1, int(quota))  # round down: safer to under- than over-allocate
+                    return max(1, math.ceil(quota))  # round down: safer to under- than over-allocate
         except (ValueError, OSError):
             pass
     return os.cpu_count() or 2
@@ -80,6 +81,12 @@ logger.info(
     f"CPU sizing: detected={_CPU_COUNT} (host os.cpu_count()={os.cpu_count()}), "
     f"torch.set_num_threads={torch.get_num_threads()}, "
     f"interop={torch.get_num_interop_threads()}"
+)
+import os
+
+logging.info(
+    f"CPU affinity: {len(os.sched_getaffinity(0))} CPUs "
+    f"{os.sched_getaffinity(0)}"
 )
 
 def _run_transcription(audio_bytes: bytes) -> str:
