@@ -52,13 +52,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# print() follows normal stdout buffering — line-buffered on a real terminal,
-# but fully block-buffered (waits for several KB) once stdout is piped/redirected,
-# which is exactly what happens inside a container or behind a process manager.
-# logging.StreamHandler flushes after every record regardless, which is why
-# uvicorn's own access logs (which go through `logging`) show up fine while our
-# print() calls didn't. Configuring our own handler explicitly here rather than
-# relying on however uvicorn's root logger happens to be set up for this process.
+
 logger = logging.getLogger("safeborn-voice")
 logger.setLevel(logging.INFO)
 if not logger.handlers:
@@ -75,23 +69,10 @@ logger.info("Loading Kokoro neural voice pipeline into memory...")
 tts_pipeline = KPipeline(lang_code='a', repo_id='hexgrad/Kokoro-82M')
 logger.info("Voice engine services are warm and ready!")
 
-# torch.set_num_threads always takes precedence over the OMP/MKL env vars set
-# above, so this is the actual authoritative bound — the env vars are a
-# best-effort backstop for anything that reads them directly instead of going
-# through torch. Leaving one core of headroom for the event loop / request
-# handling rather than letting Kokoro claim the entire quota.
+
 torch.set_num_threads(max(1, _CPU_COUNT - 1))
 torch.set_num_interop_threads(1)
 
-# stt_model.transcribe(...) and tts_pipeline(...) are blocking, CPU-bound calls.
-# Running them directly inside `async def` routes stalls the event loop for
-# every other request (including /health) until they finish. Offload them here.
-#
-# IMPORTANT: match these to the *correct* route below — /transcribe must use
-# stt_executor and /tts-stream must use tts_executor. They were swapped once
-# already (stt_executor had max_workers=2 but was wired to /tts-stream), which
-# silently let two TTS synthesis calls run concurrently and contend for CPU —
-# exactly the problem torch.set_num_threads above is trying to prevent.
 tts_executor = ThreadPoolExecutor(max_workers=1)
 stt_executor = ThreadPoolExecutor(max_workers=min(2, _CPU_COUNT))
 
@@ -104,18 +85,7 @@ logger.info(
 def _run_transcription(audio_bytes: bytes) -> str:
     started = time.monotonic()
     audio_file = io.BytesIO(audio_bytes)
-    # vad_filter strips non-speech segments (silence, background noise) before
-    # decoding. Without it, Whisper tends to hallucinate plausible-sounding
-    # phrases from silence/noise rather than returning nothing — harmless with
-    # manual push-to-talk, but the hands-free loop can legitimately end a turn
-    # on mostly-silence (a long pause, ambient noise crossing the volume
-    # threshold), and a hallucinated transcript there gets sent as if she'd
-    # actually said it.
-    #
-    # beam_size=1 (greedy decoding) instead of 3: cuts decoding work roughly
-    # 3x for a small accuracy cost that mostly doesn't matter on short
-    # conversational utterances. If transcription quality noticeably degrades
-    # in testing, raise this back up — it's a direct latency/accuracy trade.
+    
     segments, _info = stt_model.transcribe(
         audio_file,
         beam_size=1,
