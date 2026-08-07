@@ -296,11 +296,16 @@ def _kokoro_segments(clean_text: str, speed: float):
 
 def _float32_to_int16le_bytes(audio) -> bytes:
     """
-    Kokoro yields float32 waveforms in [-1, 1]. Convert to signed
-    16-bit PCM little-endian, the format the client's Web Audio API
-    decoder expects (matches _PCM_FORMAT_INT16LE header code).
+    Kokoro yields torch.Tensor segments (float32 waveform in [-1, 1]),
+    not numpy arrays — np.concatenate() in the buffered /tts-stream path
+    silently auto-converts these via numpy's array protocol, which is
+    why that path never surfaced this. Tensors don't have numpy's
+    .astype(), so it must be converted explicitly here before encoding
+    to signed 16-bit PCM little-endian (the format the client's Web
+    Audio API decoder expects — matches _PCM_FORMAT_INT16LE header code).
     """
-    clipped = np.clip(audio, -1.0, 1.0)
+    arr = audio.detach().cpu().numpy() if torch.is_tensor(audio) else np.asarray(audio)
+    clipped = np.clip(arr, -1.0, 1.0)
     return (clipped * 32767.0).astype("<i2").tobytes()
 
 
