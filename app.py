@@ -2,6 +2,7 @@ import asyncio
 import io
 import logging
 import os
+import struct
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -232,6 +233,132 @@ async def transcribe_audio(audio: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     return {"text": transcription}
+
+
+_PCM_SAMPLE_RATE = 24000  # Kokoro output rate
+_PCM_CHANNELS = 1
+_PCM_FORMAT_INT16LE = 1  # sample_format code, matches client decoder
+
+
+def _pcm_header_bytes() -> bytes:
+    """
+    8-byte binary header the progressive stream prepends before the PCM
+    body. Kept in the response body (not HTTP headers) so it survives
+    the chat_service proxy and gateway without needing CORS
+    Access-Control-Expose-Headers gymnastics.
+
+    Layout (little-endian):
+      offset 0, uint32: sample_rate
+      offset 4, uint16: channels
+      offset 6, uint16: sample_format  (1 = int16le)
+    """
+    return struct.pack("<IHH", _PCM_SAMPLE_RATE, _PCM_CHANNELS, _PCM_FORMAT_INT16LE)
+
+
+def _kokoro_segments(clean_text: str, speed: float):
+    """
+    Wraps the raw Kokoro generator so caller only sees non-empty audio
+    segments and gets per-segment timing logs, matching what _run_tts
+    logs today. Blocking generator — must be consumed on tts_executor,
+    never on the event loop thread.
+    """
+    overall_start = time.monotonic()
+    logger.info("=" * 70)
+    logger.info("TTS progressive request: %d chars", len(clean_text))
+    logger.info("Text: %r", clean_text)
+
+    generator = tts_pipeline(clean_text, voice="af_heart", speed=speed)
+
+    stage_start = time.monotonic()
+    last_segment_time = stage_start
+    total_samples = 0
+
+    for idx, (_gs, _ps, audio) in enumerate(generator, start=1):
+        now = time.monotonic()
+        seg_samples = len(audio) if audio is not None else 0
+        logger.info(
+            "[Stage 2] Kokoro segment %d generated in %.3f sec (%d samples)",
+            idx, now - last_segment_time, seg_samples,
+        )
+        last_segment_time = now
+        if audio is not None and seg_samples > 0:
+            total_samples += seg_samples
+            yield audio
+
+    logger.info(
+        "[TOTAL] progressive stream: %.3f sec, %d samples (~%.2f sec audio)",
+        time.monotonic() - overall_start,
+        total_samples,
+        total_samples / _PCM_SAMPLE_RATE if total_samples else 0.0,
+    )
+    logger.info("=" * 70)
+
+
+def _float32_to_int16le_bytes(audio) -> bytes:
+    """
+    Kokoro yields float32 waveforms in [-1, 1]. Convert to signed
+    16-bit PCM little-endian, the format the client's Web Audio API
+    decoder expects (matches _PCM_FORMAT_INT16LE header code).
+    """
+    clipped = np.clip(audio, -1.0, 1.0)
+    return (clipped * 32767.0).astype("<i2").tobytes()
+
+
+@app.get("/tts-progressive")
+async def text_to_speech_progressive(text: str = Query(...), speed: float = Query(0.90)):
+    """
+    Streams raw PCM as each Kokoro segment is produced, instead of
+    concatenating all segments into a WAV and returning it in one go
+    (see /tts-stream, which still does the buffered thing for the
+    native app path that needs a complete file to play).
+
+    First bytes reach the client in ~200-400 ms — the time it takes
+    Kokoro to produce its first segment — rather than after the entire
+    utterance has been synthesized (~1-2 s for a typical reply).
+    Combined with the frontend's incremental-per-sentence streaming,
+    that's the difference between "delay, then AI speaks" and "AI
+    starts speaking almost immediately."
+
+    Body wire format: 8-byte header then raw int16 LE PCM samples.
+    See _pcm_header_bytes() for the layout.
+    """
+    clean_text = " ".join(text.splitlines())
+    loop = asyncio.get_event_loop()
+
+    # asyncio.run_in_executor doesn't understand StopIteration — in an
+    # async context it becomes RuntimeError. Use a sentinel to make the
+    # generator exhaustion explicit and portable.
+    _SENTINEL = object()
+
+    def _safe_next(gen):
+        try:
+            return next(gen)
+        except StopIteration:
+            return _SENTINEL
+
+    async def stream_body():
+        # Prepend the 8-byte format header so the client knows sample
+        # rate / channels / format before decoding any samples.
+        yield _pcm_header_bytes()
+
+        segments = _kokoro_segments(clean_text, speed)
+        try:
+            while True:
+                segment = await loop.run_in_executor(tts_executor, _safe_next, segments)
+                if segment is _SENTINEL:
+                    break
+                yield _float32_to_int16le_bytes(segment)
+        except Exception as exc:  # noqa: BLE001 - anything here is a synth failure worth logging + terminating the stream
+            logger.error("progressive_tts_failed", exc_info=exc)
+
+    return StreamingResponse(
+        stream_body(),
+        media_type="application/octet-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 @app.get("/tts-stream")
