@@ -74,7 +74,7 @@ logger.info("Voice engine services are warm and ready!")
 torch.set_num_threads(max(1, _CPU_COUNT - 1))
 torch.set_num_interop_threads(1)
 
-tts_executor = ThreadPoolExecutor(max_workers=2)
+tts_executor = ThreadPoolExecutor(max_workers=1)
 stt_executor = ThreadPoolExecutor(max_workers=min(2, _CPU_COUNT))
 
 logger.info(
@@ -119,11 +119,15 @@ def _run_tts(clean_text: str, speed: float) -> bytes:
     overall_start = time.monotonic()
 
     logger.info("=" * 70)
-    logger.info(f"TTS Request: {len(clean_text)} chars")
-    logger.info(f"Text: {clean_text!r}")
+    logger.info("TTS Request: %d chars", len(clean_text))
+    logger.info("Text: %r", clean_text)
 
     # -------------------------------------------------------
-    # Stage 1 - Create generator
+    # Stage 1 - Initialize Kokoro generator
+    # NOTE:
+    # Frontend already performs sentence/chunk splitting.
+    # Do not split here again. Backend receives one speech unit
+    # and focuses only on synthesis.
     # -------------------------------------------------------
     t = time.monotonic()
 
@@ -131,55 +135,57 @@ def _run_tts(clean_text: str, speed: float) -> bytes:
         clean_text,
         voice="af_heart",
         speed=speed,
-        split_pattern=r"[.!?\n]"
     )
 
     logger.info(
         "[Stage 1] Generator created in %.3f sec",
-        time.monotonic() - t
+        time.monotonic() - t,
     )
 
     # -------------------------------------------------------
-    # Stage 2 - Generate chunks
+    # Stage 2 - Generate waveform segments
+    #
+    # Kokoro may internally yield multiple segments even though
+    # frontend already sent a single speech chunk.
     # -------------------------------------------------------
-    audio_chunks = []
+    audio_segments = []
 
     stage2_start = time.monotonic()
-    last_chunk = stage2_start
+    last_segment_time = stage2_start
 
     for idx, (_gs, _ps, audio) in enumerate(generator, start=1):
 
         now = time.monotonic()
 
         logger.info(
-            "[Stage 2] Chunk %d generated in %.3f sec",
+            "[Stage 2] Kokoro segment %d generated in %.3f sec",
             idx,
-            now - last_chunk
+            now - last_segment_time,
         )
 
-        last_chunk = now
+        last_segment_time = now
 
         if audio is not None and len(audio) > 0:
-            audio_chunks.append(audio)
+            audio_segments.append(audio)
 
     logger.info(
-        "[Stage 2] Total chunk generation: %.3f sec",
-        time.monotonic() - stage2_start
+        "[Stage 2] Total synthesis time: %.3f sec",
+        time.monotonic() - stage2_start,
     )
 
-    if not audio_chunks:
+    if not audio_segments:
         raise ValueError("No audio generated")
 
     # -------------------------------------------------------
-    # Stage 3 - Concatenate
+    # Stage 3 - Merge waveform segments
     # -------------------------------------------------------
     t = time.monotonic()
 
-    combined_audio = np.concatenate(audio_chunks)
+    combined_audio = np.concatenate(audio_segments)
 
     logger.info(
-        "[Stage 3] np.concatenate(): %.3f sec",
-        time.monotonic() - t
+        "[Stage 3] Audio concatenation: %.3f sec",
+        time.monotonic() - t,
     )
 
     # -------------------------------------------------------
@@ -201,15 +207,15 @@ def _run_tts(clean_text: str, speed: float) -> bytes:
 
     logger.info(
         "[Stage 4] WAV encoding: %.3f sec",
-        time.monotonic() - t
+        time.monotonic() - t,
     )
 
     # -------------------------------------------------------
-    # Total
+    # Total request time
     # -------------------------------------------------------
     logger.info(
         "[TOTAL] %.3f sec",
-        time.monotonic() - overall_start
+        time.monotonic() - overall_start,
     )
 
     logger.info("=" * 70)
