@@ -63,9 +63,55 @@ if not logger.handlers:
     logger.addHandler(_handler)
     logger.propagate = False
 
-logger.info("Loading Whisper Speech-to-Text model...")
+# WHICH WHISPER. "small" rather than "base".
+#
+# base is the second-smallest model in the family, and its weakness is
+# exactly our users: accents under-represented in its training data, on
+# short utterances with no surrounding context to lean on. A Nigerian
+# mother saying "start" to the Labour Companion got back "star", "stat",
+# "sat" — on one recorded session, a dozen times over fifty seconds
+# before one landed. small is roughly three times the parameters and is
+# where accented English starts working properly.
+#
+# WHAT IT COSTS, both of which want watching on the first deploy:
+#
+#   Latency. Whisper pads every clip to 30 seconds before encoding, so
+#   the encoder pass costs the same for a one-second command as for a
+#   full sentence, and that pass is what triples. Transcription measured
+#   around 3s on base; expect meaningfully more.
+#
+#   Memory. int8 small is roughly 250MB of weights against base's 90,
+#   in a container that is also holding Kokoro. If this OOMs on deploy,
+#   that is what happened.
+#
+# Both are one environment variable away from being put back, without a
+# code change or a rebuild.
+#
+# WORTH AN EXPERIMENT: "small.en". The English-only models generally beat
+# their multilingual counterparts on English at identical size, and the
+# labour command path already pins language="en", so nothing is lost
+# there. It is not the default because the AI coach path does NOT pin a
+# language, and because how an English-only model handles Nigerian
+# Pidgin is a question for someone who speaks it, not a guess worth
+# making from here. STT_MODEL_SIZE=small.en is the whole experiment.
+_STT_MODEL_SIZE = os.getenv("STT_MODEL_SIZE", "small")
+
+# Deliberately NOT derived from _CPU_COUNT like OMP, MKL and torch are.
+# The 2 here is load-bearing: Whisper and Kokoro share this container,
+# and whoever wrote the line below measured cache thrashing when they
+# competed. If small proves too slow, this is the first lever to try —
+# but it is a trade against TTS, not a free win.
+_STT_CPU_THREADS = int(os.getenv("STT_CPU_THREADS", "2"))
+
+logger.info("Loading Whisper Speech-to-Text model (%s)...", _STT_MODEL_SIZE)
 # Optimized Whisper initialization to prevent CPU cache thrashing
-stt_model = WhisperModel("base", device="cpu", compute_type="int8", cpu_threads=2, num_workers=1)
+stt_model = WhisperModel(
+    _STT_MODEL_SIZE,
+    device="cpu",
+    compute_type="int8",
+    cpu_threads=_STT_CPU_THREADS,
+    num_workers=1,
+)
 
 logger.info("Loading Kokoro neural voice pipeline into memory...")
 tts_pipeline = KPipeline(lang_code='a', repo_id='hexgrad/Kokoro-82M')
@@ -94,6 +140,7 @@ logging.info(
     f"""
 CPU config:
 Detected CPUs: {_CPU_COUNT}
+STT model: {_STT_MODEL_SIZE} (int8, cpu_threads={_STT_CPU_THREADS})
 OMP: {os.getenv('OMP_NUM_THREADS')}
 MKL: {os.getenv('MKL_NUM_THREADS')}
 Torch threads: {torch.get_num_threads()}
