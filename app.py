@@ -87,14 +87,28 @@ if not logger.handlers:
 # Both are one environment variable away from being put back, without a
 # code change or a rebuild.
 #
-# WORTH AN EXPERIMENT: "small.en". The English-only models generally beat
-# their multilingual counterparts on English at identical size, and the
-# labour command path already pins language="en", so nothing is lost
-# there. It is not the default because the AI coach path does NOT pin a
-# language, and because how an English-only model handles Nigerian
-# Pidgin is a question for someone who speaks it, not a guess worth
-# making from here. STT_MODEL_SIZE=small.en is the whole experiment.
-_STT_MODEL_SIZE = os.getenv("STT_MODEL_SIZE", "small")
+# WHY ".en". The English-only models generally beat their multilingual
+# counterparts on English at identical size — they spend their whole
+# capacity on one language instead of ninety-nine — and the labour
+# command path already pins language="en", so nothing is given up there.
+#
+# WHAT IT GIVES UP, AND IT IS NOT NOTHING. This model can only produce
+# English. Every other language becomes English-shaped noise, silently:
+# there is no error, just a wrong transcript. Two consequences worth
+# holding on to:
+#
+#   The AI coach path does not pin a language, so it was at least
+#   attempting other languages before. In practice on "base" it was
+#   attempting them very badly — Yoruba and Hausa are among the worst
+#   served languages in Whisper, and Igbo is not in its language list at
+#   all — so little is actually lost. But it is a change, not a no-op.
+#
+#   Nigerian Pidgin is not a Whisper language either way. An English
+#   model is arguably the closer fit for it, but that is a guess and
+#   wants a speaker to confirm rather than an assumption from here.
+#
+# STT_MODEL_SIZE=small puts the multilingual model back.
+_STT_MODEL_SIZE = os.getenv("STT_MODEL_SIZE", "small.en")
 
 # Deliberately NOT derived from _CPU_COUNT like OMP, MKL and torch are.
 # The 2 here is load-bearing: Whisper and Kokoro share this container,
@@ -190,6 +204,14 @@ def _run_transcription(audio_bytes: bytes, mode: str = "speech") -> str:
                          that detection is a coin toss, and picking the
                          wrong language does not degrade the transcript,
                          it destroys it.
+
+                         Passed unconditionally, including on an
+                         English-only model where it is redundant:
+                         faster-whisper only warns when the language
+                         differs from "en", and keeping it here means
+                         STT_MODEL_SIZE can be switched back to a
+                         multilingual build without this silently
+                         reverting to language detection.
 
     hotwords             Biases decoding toward the words she is actually
                          going to say. See _COMMAND_HOTWORDS.
