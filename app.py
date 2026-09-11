@@ -37,7 +37,7 @@ os.environ.setdefault("MKL_NUM_THREADS", str(max(1, _CPU_COUNT - 1)))
 import torch
 import numpy as np
 import soundfile as sf
-from fastapi import FastAPI, HTTPException, Query, UploadFile, File
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from kokoro import KPipeline
@@ -63,9 +63,55 @@ if not logger.handlers:
     logger.addHandler(_handler)
     logger.propagate = False
 
-logger.info("Loading Whisper Speech-to-Text model...")
+# WHICH WHISPER. "small" rather than "base".
+#
+# base is the second-smallest model in the family, and its weakness is
+# exactly our users: accents under-represented in its training data, on
+# short utterances with no surrounding context to lean on. A Nigerian
+# mother saying "start" to the Labour Companion got back "star", "stat",
+# "sat" — on one recorded session, a dozen times over fifty seconds
+# before one landed. small is roughly three times the parameters and is
+# where accented English starts working properly.
+#
+# WHAT IT COSTS, both of which want watching on the first deploy:
+#
+#   Latency. Whisper pads every clip to 30 seconds before encoding, so
+#   the encoder pass costs the same for a one-second command as for a
+#   full sentence, and that pass is what triples. Transcription measured
+#   around 3s on base; expect meaningfully more.
+#
+#   Memory. int8 small is roughly 250MB of weights against base's 90,
+#   in a container that is also holding Kokoro. If this OOMs on deploy,
+#   that is what happened.
+#
+# Both are one environment variable away from being put back, without a
+# code change or a rebuild.
+#
+# WORTH AN EXPERIMENT: "small.en". The English-only models generally beat
+# their multilingual counterparts on English at identical size, and the
+# labour command path already pins language="en", so nothing is lost
+# there. It is not the default because the AI coach path does NOT pin a
+# language, and because how an English-only model handles Nigerian
+# Pidgin is a question for someone who speaks it, not a guess worth
+# making from here. STT_MODEL_SIZE=small.en is the whole experiment.
+_STT_MODEL_SIZE = os.getenv("STT_MODEL_SIZE", "small")
+
+# Deliberately NOT derived from _CPU_COUNT like OMP, MKL and torch are.
+# The 2 here is load-bearing: Whisper and Kokoro share this container,
+# and whoever wrote the line below measured cache thrashing when they
+# competed. If small proves too slow, this is the first lever to try —
+# but it is a trade against TTS, not a free win.
+_STT_CPU_THREADS = int(os.getenv("STT_CPU_THREADS", "2"))
+
+logger.info("Loading Whisper Speech-to-Text model (%s)...", _STT_MODEL_SIZE)
 # Optimized Whisper initialization to prevent CPU cache thrashing
-stt_model = WhisperModel("base", device="cpu", compute_type="int8", cpu_threads=2, num_workers=1)
+stt_model = WhisperModel(
+    _STT_MODEL_SIZE,
+    device="cpu",
+    compute_type="int8",
+    cpu_threads=_STT_CPU_THREADS,
+    num_workers=1,
+)
 
 logger.info("Loading Kokoro neural voice pipeline into memory...")
 tts_pipeline = KPipeline(lang_code='a', repo_id='hexgrad/Kokoro-82M')
@@ -94,6 +140,7 @@ logging.info(
     f"""
 CPU config:
 Detected CPUs: {_CPU_COUNT}
+STT model: {_STT_MODEL_SIZE} (int8, cpu_threads={_STT_CPU_THREADS})
 OMP: {os.getenv('OMP_NUM_THREADS')}
 MKL: {os.getenv('MKL_NUM_THREADS')}
 Torch threads: {torch.get_num_threads()}
@@ -101,18 +148,107 @@ Torch interop: {torch.get_num_interop_threads()}
 """
 )
 
-def _run_transcription(audio_bytes: bytes) -> str:
+# The vocabulary the Labour Companion listens for. faster-whisper
+# prepends these to the decoder prompt (see Tokenizer/get_prompt), so
+# words that appear here are far likelier to come back out.
+#
+# HOTWORDS RATHER THAN initial_prompt, AND SHORT. The two compose —
+# get_prompt prepends hotwords and then any previous tokens — so using
+# both would only make the prompt longer. Length is the thing to avoid:
+# Whisper's best-known failure on a near-silent clip is echoing its own
+# prompt back as the transcript, and we have just turned the
+# voice-activity filter off, so near-silent clips now reach the decoder.
+# A bare word list is the smallest bias that does the job, and the app
+# shows the mother what it heard, so an echo is visible rather than
+# silent.
+#
+# WHY IT MATTERS SO MUCH HERE. A labour command is ONE WORD with no
+# surrounding context, which is close to the worst input a Whisper-class
+# model can be given: it is trained on continuous speech and leans hard
+# on context it does not have. A Nigerian mother saying "start" gets back
+# "star", "stat", "sat", "tart" — and on a recorded session she said it
+# perhaps a dozen times over fifty seconds before one landed. The prompt
+# is what puts those words back within reach.
+_COMMAND_HOTWORDS = "start begin stop over done finished help hurts"
+
+
+def _run_transcription(audio_bytes: bytes, mode: str = "speech") -> str:
+    """
+    `mode` picks the decoder settings, because the two callers of this
+    service want opposite things.
+
+      "speech"   the AI coach — whole sentences, conversational, and the
+                 settings that have always been here.
+      "command"  the Labour Companion — one word, often under a second,
+                 spoken by a woman in pain who is not going to repeat
+                 herself ten times.
+
+    WHAT "command" CHANGES, AND WHY EACH ONE:
+
+    language="en"        Whisper otherwise detects the language from the
+                         audio. On a one-second clip of accented English
+                         that detection is a coin toss, and picking the
+                         wrong language does not degrade the transcript,
+                         it destroys it.
+
+    hotwords             Biases decoding toward the words she is actually
+                         going to say. See _COMMAND_HOTWORDS.
+
+    vad_filter=False     THIS IS THE ONE MOST LIKELY TO HAVE BEEN EATING
+                         HER COMMANDS. The voice-activity filter, with a
+                         500ms silence window, is being handed a clip of
+                         roughly a second and a half: a short word and the
+                         600ms of quiet that told the client to stop
+                         recording. It can trim that to nothing, and
+                         faster-whisper then returns zero segments, which
+                         this function joins into "". An empty string is
+                         indistinguishable from silence downstream, so the
+                         app simply listened again and said nothing.
+
+                         The client already does its own voice-activity
+                         detection to decide when to close the microphone.
+                         Doing it twice, with the second one unaware of
+                         how short the clip is, is how the audio went
+                         missing.
+
+    condition_on_previous_text=False
+                         Each command is its own utterance with no history.
+                         Left on, Whisper can carry text between calls and
+                         loop on it.
+
+    beam_size=5          Greedy decoding is a reasonable trade over a long
+                         sentence where context can rescue a bad step. Over
+                         a single short word there is no context to rescue
+                         anything, and the clip is small enough that the
+                         extra beams cost little.
+    """
     started = time.monotonic()
     audio_file = io.BytesIO(audio_bytes)
-    
-    segments, _info = stt_model.transcribe(
-        audio_file,
-        beam_size=1,
-        vad_filter=True,
-        vad_parameters={"min_silence_duration_ms": 500},
-    )
+
+    if mode == "command":
+        segments, _info = stt_model.transcribe(
+            audio_file,
+            beam_size=5,
+            language="en",
+            hotwords=_COMMAND_HOTWORDS,
+            condition_on_previous_text=False,
+            vad_filter=False,
+        )
+    else:
+        segments, _info = stt_model.transcribe(
+            audio_file,
+            beam_size=1,
+            vad_filter=True,
+            vad_parameters={"min_silence_duration_ms": 500},
+        )
+
     text = " ".join(segment.text for segment in segments).strip()
-    logger.info(f"[timing] transcription took {time.monotonic() - started:.2f}s")
+    logger.info(
+        "[timing] transcription (%s) took %.2fs -> %r",
+        mode,
+        time.monotonic() - started,
+        text,
+    )
     return text
 
 
@@ -225,11 +361,22 @@ def _run_tts(clean_text: str, speed: float) -> bytes:
 
 
 @app.post("/transcribe")
-async def transcribe_audio(audio: UploadFile = File(...)):
+async def transcribe_audio(
+    audio: UploadFile = File(...),
+    mode: str = Form("speech"),
+):
+    """
+    `mode` is optional and defaults to "speech", so every existing caller
+    keeps exactly the behaviour it has now. The Labour Companion's proxy
+    sends "command" — see _run_transcription for what that changes.
+    """
     audio_bytes = await audio.read()
+    requested = mode if mode in {"speech", "command"} else "speech"
     loop = asyncio.get_event_loop()
     try:
-        transcription = await loop.run_in_executor(stt_executor, _run_transcription, audio_bytes)
+        transcription = await loop.run_in_executor(
+            stt_executor, _run_transcription, audio_bytes, requested
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     return {"text": transcription}
